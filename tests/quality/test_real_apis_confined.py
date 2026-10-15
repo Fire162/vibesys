@@ -1637,17 +1637,12 @@ _LANE_B = "lane B (runtime, server and entrypoints)"
 _SANDBOX_WIRING = "the vs-sandbox GPU and SkyPilot wiring: thread Threads and Network down"
 REAL_DEFAULT_PENDING: dict[str, str] = {
     "libs/vs-agent/src/vs_agent/images.py": _LANE_A,
-    "libs/vs-runtime/src/vs_runtime/_run_environment.py": f"{_LANE_A}: OsProcesses",
     "libs/vs-runtime/src/vs_runtime/_semantic_slurm_evaluation.py": _LANE_A,
     "libs/vs-runtime/src/vs_runtime/api/slurm_evaluation_stack.py": _LANE_B,
-    "libs/vs-sandbox/src/vs_sandbox/agent_gpu.py": _LANE_A,
     "libs/vs-sandbox/src/vs_sandbox/fake_command_runner.py": (
         "the Fake takes its Threads from the test (75 call sites)"
     ),
     "libs/vs-sandbox/src/vs_sandbox/gpu_monitor.py": _SANDBOX_WIRING,
-    "libs/vs-sandbox/src/vs_sandbox/host_command_broker.py": (
-        f"{_LANE_B}: SlurmEnvironment has no Threads or Network to hand the broker"
-    ),
     "libs/vs-sandbox/src/vs_sandbox/host_sandbox.py": _SANDBOX_WIRING,
     "libs/vs-sandbox/src/vs_sandbox/skypilot_bridge.py": _SANDBOX_WIRING,
     "libs/vs-sandbox/src/vs_sandbox/skypilot_runner.py": _SANDBOX_WIRING,
