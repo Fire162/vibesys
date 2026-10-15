@@ -129,6 +129,7 @@ from vs_sim.waits import (
 
 __all__ = [
     "DEEP_NESTING",
+    "DEFAULT_BUFFER_BYTES",
     "HANG_GUARD_S",
     "NO_PROCESSES",
     "OVERSIZED_BYTES",
@@ -148,7 +149,6 @@ __all__ = [
     "CommandProbeContract",
     "CrashableClock",
     "Depth",
-    "DEFAULT_BUFFER_BYTES",
     "End",
     "EventTrace",
     "FakeForegroundChild",

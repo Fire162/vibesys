@@ -50,7 +50,7 @@ _ACCEPT_CLOSE_POLL_SECONDS = 0.1
 _ACCEPT_RETRY_BACKOFF_SECONDS = 0.1
 MAX_SOCKET_PATH_BYTES = 103 if sys.platform == "darwin" else 107
 _RECV_BYTES = 65536
-SEND_BOUND_SECONDS = 30.0
+_SEND_BOUND_SECONDS = 30.0
 """How long one message may wait for a client to make room for it before the server hangs up.
 
 A client that stops reading fills its socket buffer, and an unbounded send would then hold
@@ -122,13 +122,11 @@ class _ClientSession:
         api: RunApi,
         subscriptions: SubscriptionTracker,
         threads: Threads,
-        send_bound: float,
     ) -> None:
         self._connection = connection
         self._api = api
         self._subscriptions = subscriptions
         self._threads = threads
-        self._send_bound = send_bound
         self._hangup_watcher: Worker | None = None
 
     def handle(self) -> None:
@@ -354,13 +352,13 @@ class _ClientSession:
     def _write_message(self, message: BaseModel) -> None:
         payload = message.model_dump_json()
         try:
-            self._connection.send(payload.encode() + b"\n", self._send_bound)
+            self._connection.send(payload.encode() + b"\n", _SEND_BOUND_SECONDS)
         except TimeoutError as exc:
             # Part of the message may have gone out, so the stream cannot continue.
             _LOG.warning(
                 "a client read nothing for %g s while the server was writing to it; "
                 "disconnecting it",
-                self._send_bound,
+                _SEND_BOUND_SECONDS,
             )
             raise _PeerGoneError from exc
         except OSError as exc:
@@ -382,13 +380,12 @@ class UnixJsonlServer:
         subscriptions: SubscriptionTracker | None,
         threads: Threads,
         network: Network,
-        send_bound: float = SEND_BOUND_SECONDS,
     ) -> None:
         """Create a Unix server, optionally sharing subscription accounting.
 
         ``threads`` runs the accept loop and each client, and paces idle
         streams; ``network`` binds the socket. A client that leaves a message
-        unsent for ``send_bound`` seconds is disconnected, so it holds neither
+        unsent for ``_SEND_BOUND_SECONDS`` is disconnected, so it holds neither
         its worker nor the server's exit.
         """
         self.path = path
@@ -396,7 +393,6 @@ class UnixJsonlServer:
         self._threads = threads
         self._subscriptions = subscriptions or SubscriptionTracker(threads=threads)
         self._network = network
-        self._send_bound = send_bound
         self._listener: Listener | None = None
         self._acceptor: Worker | None = None
         self._guard = self._threads.lock()
@@ -472,9 +468,7 @@ class UnixJsonlServer:
     def _serve(self, owned: _OwnedClientSession) -> None:
         owned.worker_ready.wait()
         owned.owner = self._thread_identity.get()
-        session = _ClientSession(
-            owned.connection, self.api, self._subscriptions, self._threads, self._send_bound
-        )
+        session = _ClientSession(owned.connection, self.api, self._subscriptions, self._threads)
         try:
             session.handle()
         except _PeerGoneError:

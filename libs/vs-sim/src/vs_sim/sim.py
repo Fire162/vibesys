@@ -123,9 +123,7 @@ class Sim:
             threads=threads,
             blocking=SimBlockingRunner(threads),
             processes=processes,
-            network=SimNetwork(
-                threads, buffer_bytes=network_buffer_bytes, faults=network_faults
-            ),
+            network=SimNetwork(threads, buffer_bytes=network_buffer_bytes, faults=network_faults),
             signaller=signaller,
         )
 

@@ -609,7 +609,9 @@ def _run(tmp_path: Path, sim: Sim, faults: _Faults, stall: _Stall | None = None)
             platform=platform,
         )
         client = _Client(network, socket_path)
-        stalled = None if stall is None else _StalledSubscriber(stall, network, socket_path, threads)
+        stalled = (
+            None if stall is None else _StalledSubscriber(stall, network, socket_path, threads)
+        )
         follower = threads.spawn(
             lambda: client.follow(runtime) if stalled is None else stalled.then(client, runtime),
             name="client",

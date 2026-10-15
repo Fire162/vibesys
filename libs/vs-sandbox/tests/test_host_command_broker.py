@@ -334,6 +334,7 @@ class TestGpuOperation:
                 write: Callable[[bytes], None],
                 cancel: Event,
             ) -> int:
+                del request, command
                 for _ in range(1024):
                     if cancel.is_set():
                         self.cancelled.set()
