@@ -40,7 +40,7 @@ from vs_sandbox.host_resources import HostResourceAccess
 from vs_sandbox.host_sandbox import WorkspaceSandbox
 from vs_sandbox.lifecycle import SandboxLifecycle, SandboxLifecycleHooks
 from vs_sandbox.process_execution import KILL, PipedStoppableProcess, RemoteProcesses
-from vs_sim.api import NotReleasedError, ProcessTimeoutError
+from vs_sim.api import DISCARD, NotReleasedError, ProcessTimeoutError
 
 if TYPE_CHECKING:
     import signal
@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from vs_sandbox.docker_states import ContainerLife
     from vs_sandbox.execution import CommandResult
     from vs_sandbox.host_resources import HostResource
-    from vs_sim.api import Event, Threads
+    from vs_sim.api import Event, OutputSink, Threads
 
 # Global registry of live containers for cleanup on exit / SIGINT: each container's id and
 # the Docker CLI that started it, which is the one that can stop it.
@@ -592,8 +592,14 @@ class DockerSandbox(WorkspaceSandbox):
         """Return the ``docker run`` flags a docker-in-docker sandbox adds."""
         return ["--runtime", SYSBOX_DOCKER_RUNTIME] if self._docker_in_docker else []
 
-    def start(self) -> None:
-        """Start the Docker container."""
+    def start(self, *, output: OutputSink = DISCARD) -> None:
+        """Start the Docker container.
+
+        Every chunk ``docker run`` writes (an image pull's progress, the new
+        container's ID, a daemon error) reaches *output* as it is written.
+        ``docker.log`` still records the command and a bounded result after it
+        exits.
+        """
         if self._docker_in_docker:
             require_sysbox_runtime(self._docker)
         self._container_name = f"vibesys-{uuid.uuid4().hex[:12]}"
@@ -605,7 +611,7 @@ class DockerSandbox(WorkspaceSandbox):
         # sweep must know it if every removal below fails too.
         _live_containers[self._container_name] = self._docker
         try:
-            result = self._docker.run(cmd, timeout_seconds=self._start_timeout)
+            result = self._docker.run(cmd, timeout_seconds=self._start_timeout, output=output)
         except BaseException as exc:
             # The daemon may have created the container before the client
             # died, timed out, or was interrupted; its name is the only handle.
@@ -1001,6 +1007,7 @@ class DockerSandbox(WorkspaceSandbox):
         *,
         timeout: int | None = None,
         cancel: Event | None = None,
+        output: OutputSink = DISCARD,
     ) -> CommandResult:
         """Execute *command* as root inside the started container.
 
@@ -1008,7 +1015,7 @@ class DockerSandbox(WorkspaceSandbox):
         user is not root, so a step that needs root (installing system
         packages) uses this instead.
         """
-        return self._execute(command, timeout=timeout, cancel=cancel, user="root")
+        return self._execute(command, timeout=timeout, cancel=cancel, user="root", output=output)
 
     def execute(
         self,
@@ -1016,6 +1023,7 @@ class DockerSandbox(WorkspaceSandbox):
         *,
         timeout: int | None = None,
         cancel: Event | None = None,
+        output: OutputSink = DISCARD,
     ) -> CommandResult:
         """Execute a command inside the Docker container.
 
@@ -1026,7 +1034,7 @@ class DockerSandbox(WorkspaceSandbox):
         documented in :mod:`vs_sandbox.command_execution`; every sandbox kind
         shares it.
         """
-        return self._execute(command, timeout=timeout, cancel=cancel, user=None)
+        return self._execute(command, timeout=timeout, cancel=cancel, user=None, output=output)
 
     def _execute(
         self,
@@ -1035,6 +1043,7 @@ class DockerSandbox(WorkspaceSandbox):
         timeout: int | None,
         cancel: Event | None,
         user: str | None,
+        output: OutputSink,
     ) -> CommandResult:
         if self._container_id is None:
             raise DockerSandboxNotStartedError.operation_before_start()
@@ -1061,7 +1070,7 @@ class DockerSandbox(WorkspaceSandbox):
             cancel=cancel,
             max_output_chars=self._max_output_bytes,
             launch=lambda: PipedStoppableProcess(
-                self._docker.spawn(exec_cmd), threads=self._threads
+                self._docker.spawn(exec_cmd), threads=self._threads, output=output
             ),
             signal_remote=_ExecStop(self._docker, container_id, exec_id, user).send,
             threads=self._threads,

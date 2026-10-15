@@ -24,6 +24,7 @@ import {QuotaBanner} from './quota-banner.js';
 import {RoundRail} from './round-rail.js';
 import {RunControls} from './run-controls.js';
 import {RunSummary} from './run-summary.js';
+import {StartupLogPanel, type StartupLogPanelProps} from './startup-log.js';
 import {Transcript} from './transcript.js';
 
 export interface RunPageProps {
@@ -38,6 +39,13 @@ export interface RunPageProps {
   readonly onRetryReplay: () => void;
   /** Null for replay, which has no command channel by contract. */
   readonly onCommand: ((input: RunCommand) => Promise<RunCommandOutcome>) | null;
+  /**
+   * The current time in epoch milliseconds, for the starting label's elapsed time. The page owner
+   * ticks it (see `apps/web`), since presentational code schedules no timers.
+   */
+  readonly now: number;
+  /** The startup log panel; absent where the page has no way to read logs (the browser). */
+  readonly startupLog?: StartupLogPanelProps | null;
 }
 
 export function RunPage({
@@ -46,11 +54,13 @@ export function RunPage({
   session,
   replayFailure,
   headerAction,
+  now,
+  startupLog = null,
   ...events
 }: RunPageProps): JSX.Element {
   const [requestedIterationId, setRequestedIterationId] = useState<string | null>(null);
   const banners = connectionBanners(run, session ?? REPLAY_SESSION);
-  const header = pageHeader(run, session);
+  const header = pageHeader(run, session, now);
   const roots = iterationRoots(iterations, run);
   const selectedIterationId = roots.some(root => root.id === requestedIterationId)
     ? requestedIterationId
@@ -78,6 +88,7 @@ export function RunPage({
           episode's resume-click `pending`/`result` state, which the component itself only
           tracks for its own, current fact. */}
       <QuotaBanner key={run.quota.sequence} banner={quotaBanner(run)} command={events.onCommand} />
+      {startupLog?.view.visible === true && <StartupLogPanel {...startupLog} />}
       <RunSummary run={run} iterations={iterations} />
       <div className="run-layout">
         <RoundRail
