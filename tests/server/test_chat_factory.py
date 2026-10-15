@@ -23,7 +23,7 @@ from server.chat.prompts import (
 )
 from server.run_attachment import AgentSelection, RunAttachment
 from vs_sim.api import OsThreads
-from vs_sim.api.testing import ManualClock
+from vs_sim.api.testing import ManualClock, SimThreads
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -286,7 +286,7 @@ def test_an_agent_whose_close_failed_is_closed_again_on_the_next_factory_close(
         build_agent=build_chat_agent,
         fallback=lambda _question: "recorded summary",
         clock=ManualClock(),
-        threads=OsThreads(),
+        threads=SimThreads(),
     )
     try:
         factory.start()
