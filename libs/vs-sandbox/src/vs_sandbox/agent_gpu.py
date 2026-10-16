@@ -7,6 +7,7 @@ the partition choice, and the blocking ``srun`` launch the host broker uses.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import secrets
 import shlex
@@ -49,6 +50,10 @@ _CONFIRM_INTERVAL_SECONDS = 5
 _WATCHER_JOIN_SECONDS = _SCANCEL_ATTEMPTS * _SCANCEL_TIMEOUT_SECONDS + _CANCEL_GRACE_SECONDS
 _READ_CHARACTERS = 65_536
 _MAX_QUEUE_MINUTES = 60 * 24 * 365
+_MAX_PREFIX_CHARS = 32
+#: Hex characters of the run's digest in its job name prefix: 32 bits keeps two
+#: concurrent runs of one user apart and leaves the operator's prefix most of its room.
+_RUN_TAG_CHARS = 8
 
 
 def _is_normalized_absolute(path: str) -> bool:
@@ -77,6 +82,13 @@ class AgentGpuConfig(BaseModel):
     ``read_only_paths``: extra absolute host paths, such as the operator's
     Python environment, that it may read and never write. Without them an
     interpreter or dependency outside the workspace is invisible to the job.
+
+    ``max_concurrent_jobs`` caps how many of the run's agent GPU jobs, across
+    all of its agents, are submitted to the scheduler at once (``None``: no
+    cap). A request past the cap waits on the submit host, first come first
+    served, and is submitted when one of the run's jobs ends; its ``--time``
+    limit starts at submission. The cap keeps one run from monopolizing a
+    shared partition with a steady stream of short jobs.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -88,6 +100,7 @@ class AgentGpuConfig(BaseModel):
     windows_command: tuple[str, ...] | None = None
     srun_arguments: tuple[str, ...] = ()
     read_only_paths: tuple[str, ...] = ()
+    max_concurrent_jobs: Annotated[int, Field(gt=0)] | None = None
     job_name_prefix: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")] = (
         "vibesys-gpu"
     )
@@ -102,6 +115,17 @@ class AgentGpuConfig(BaseModel):
     @classmethod
     def _normalize_arrays(cls, value: object) -> object:
         return tuple(value) if isinstance(value, list) else value
+
+    def for_run(self, run_id: str) -> AgentGpuConfig:
+        """This configuration with a job name prefix that only ``run_id``'s jobs carry.
+
+        The operator's prefix is kept (cut to leave room) and a digest of the run id is
+        appended, so the run's own GPU jobs can be told apart in the queue from another
+        run's of the same user. The result still satisfies the prefix pattern.
+        """
+        tag = hashlib.sha256(run_id.encode()).hexdigest()[:_RUN_TAG_CHARS]
+        kept = self.job_name_prefix[: _MAX_PREFIX_CHARS - len(tag) - 1]
+        return self.model_copy(update={"job_name_prefix": f"{kept}-{tag}"})
 
     @field_validator("partitions", "srun_arguments")
     @classmethod

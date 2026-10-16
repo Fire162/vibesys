@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import TYPE_CHECKING, Any, Self, overload
+from typing import TYPE_CHECKING, Any, Self, Unpack, overload
 
 from vs_core._registry import ContractError
 from vs_core.types.common import Capabilities, Limits, RevisionRef, Seconds, TaskTerms, Value
@@ -16,7 +16,18 @@ from ._evaluation import Evaluation
 from ._kit import Kit
 from ._owners import Owners
 from ._retry import Again, GaveUp, RetryPolicy, Tries
-from ._sources import First, Source, StopSource, Task, Timer
+from ._sources import (
+    Channel,
+    ChannelKey,
+    First,
+    Latch,
+    LatchKey,
+    Source,
+    StopSource,
+    Task,
+    Timer,
+)
+from ._spans import AttemptOutcome
 from ._winner import INPUT, Input, Kept
 from ._workspaces import Workspaces
 
@@ -25,7 +36,9 @@ if TYPE_CHECKING:
 
     from pydantic import BaseModel
 
+    from ._labels import LabelFields, SpanKind
     from ._run import _Run
+    from ._spans import SpanId
 
 
 class Clock:
@@ -88,6 +101,23 @@ class Flow:
         self, a: Source[A], b: Source[B], c: Source[C], d: Source[D], /
     ) -> A | B | C | D: ...
 
+    @overload
+    async def first[A, B, C, D, E](
+        self, a: Source[A], b: Source[B], c: Source[C], d: Source[D], e: Source[E], /
+    ) -> A | B | C | D | E: ...
+
+    @overload
+    async def first[A, B, C, D, E, F](
+        self,
+        a: Source[A],
+        b: Source[B],
+        c: Source[C],
+        d: Source[D],
+        e: Source[E],
+        f: Source[F],
+        /,
+    ) -> A | B | C | D | E | F: ...
+
     async def first(self, *sources: Source[object]) -> object:
         """The next value of whichever source is ready first; ties go to the earliest."""
         self._kit.stop_point()
@@ -96,6 +126,23 @@ class Flow:
     def timer(self, at: Seconds) -> Timer:
         """A source that fires once, when the run clock reaches ``at``."""
         return self._kit.timer(at)
+
+    def latch[T](self, key: LatchKey[T]) -> Latch[T]:
+        """A handle on the run-wide latch ``key``: ``set`` it once, or wait for its value.
+
+        For a fact one flow learns and the flows beside it wait for, such as a measurement every
+        later step builds on. Each handle yields the value once; take one per wait.
+        """
+        return self._run.latch(key)
+
+    def channel[T](self, key: ChannelKey[T]) -> Channel[T]:
+        """A handle on the run-wide channel ``key``: ``send`` to it, or wait for its next value.
+
+        For facts several flows report, as they reach them, to the one flow that keeps their
+        record (each workstream telling the root it waits for an evaluation slot). Values are
+        read in the order sent, each once.
+        """
+        return self._run.channel(key)
 
     @property
     def path(self) -> str:
@@ -120,15 +167,35 @@ class Flow:
         self, attempt: Callable[[Tries[R]], Awaitable[V | Again[R]]], policy: RetryPolicy
     ) -> V | GaveUp[R]:
         """Repeat ``attempt`` until it gives a value, at most ``policy.max_tries`` times."""
+        trace, span = self._run.trace, self._kit.task.span_id
         reasons: list[R] = []
         for number in range(1, policy.max_tries + 1):
+            trace.attempt_started(span, number, policy.max_tries)
             outcome = await attempt(Tries(number=number, reasons=tuple(reasons)))
             if not isinstance(outcome, Again):
+                trace.attempt_ended(span, AttemptOutcome.DONE, None)
                 return outcome
             reasons.append(outcome.reason)
+            last = number == policy.max_tries
+            ending = AttemptOutcome.GAVE_UP if last else AttemptOutcome.AGAIN
+            trace.attempt_ended(span, ending, str(outcome.reason))
             if policy.backoff is not None and number < policy.max_tries:
                 await self.timer(self._kit.now() + policy.backoff.delay(number - 1))
         return GaveUp(reasons=tuple(reasons))
+
+    @property
+    def span(self) -> SpanId:
+        """This flow's span in the run trace: what another span's link names it by."""
+        return self._kit.task.span_id
+
+    def label(self, kind: SpanKind, **fields: Unpack[LabelFields]) -> None:
+        """Label this flow's span as ``kind`` (declared at ``@search``).
+
+        ``fields`` (``title``, ``links``, ``attrs``, ``verdict``, ``reason``) replace those
+        they name; the rest keep their values. An undeclared kind, attribute, relation or
+        verdict, or a link to a span the run has not recorded, is a ``ContractError``.
+        """
+        self._run.label(self.span, kind, fields)
 
     def checkpoint(self, snapshot: object) -> None:
         """Record ``snapshot``: where a code change may resume this flow (see ``flow``)."""
@@ -220,7 +287,7 @@ class Group[T](Source[T | TaskStopped]):
         """
         if self.free <= 0:
             raise ContractError(("group", "start"), "the group is full: read `free` first")
-        return self._run.begin_task(self._owner.path, self, key, (fn, args))
+        return self._run.begin_task(self._owner.task, self, key, (fn, args))
 
     async def __aenter__(self) -> Self:
         """Enter the scope."""

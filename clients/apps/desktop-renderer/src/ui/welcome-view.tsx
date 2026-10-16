@@ -12,8 +12,8 @@ import type {
   CompletionState,
   HostAction,
   HostState,
-  InspectorAction,
-  InspectorState,
+  InspectorSheetAction,
+  InspectorSheetState,
   PickerAction,
   PickerState,
 } from '@vibesys/feature-hosts/state';
@@ -25,7 +25,7 @@ import {type ProjectField, StartSheet} from '@vibesys/feature-start-run/renderer
 import type {StartAction, StartState} from '@vibesys/feature-start-run/state';
 import type {HostKey, HostRun} from '@vibesys/hosts';
 import {type RecentRun, stopKey, suggestProjects} from '@vibesys/runs';
-import {Button} from '@vibesys/ui';
+import {Button} from '@vibesys/ui/legacy';
 import type {JSX, ReactNode} from 'react';
 import {WORDMARK} from './welcome-banner.js';
 
@@ -36,7 +36,7 @@ interface WelcomeSenders {
   readonly start: (action: StartAction) => void;
   readonly picker: (action: PickerAction) => void;
   readonly completion: (action: CompletionAction) => void;
-  readonly inspector: (action: InspectorAction) => void;
+  readonly inspector: (action: InspectorSheetAction) => void;
 }
 
 type Attached = NonNullable<WelcomeState['chrome']['attached']>;
@@ -64,7 +64,7 @@ export interface WelcomeViewProps {
   readonly start: StartState;
   readonly picker: PickerState;
   readonly completion: CompletionState;
-  readonly inspector: InspectorState;
+  readonly inspector: InspectorSheetState;
   readonly send: WelcomeSenders;
 }
 

@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING
 from pydantic import TypeAdapter
 
 from server.host_api import (
+    RUN_EVENTS_FILE,
+    RUN_EVENTS_READ_MAX_BYTES,
     Checkout,
     DetachedLaunchErrorCode,
     DetachedLaunchFailure,
@@ -37,17 +39,20 @@ from server.host_api import (
     TaskSummary,
 )
 from server.host_helper_logs import (
+    LogStoreCorruptError,
     RunLocation,
     StoredBytes,
     UnknownInstanceError,
     UnknownLogStreamError,
 )
 from server.host_helper_requests import (
+    EventPage,
     PathHints,
     ProjectLookupError,
     ProjectRun,
     Scan,
     ScannedEntry,
+    event_page,
 )
 from vs_decode.api import Unreadable, decode_json
 from vs_project.api import Project, ProjectError
@@ -104,6 +109,19 @@ class FileProjects:
     def require_initialized(self, project: Path) -> Path:
         """The project's root, once it is known to define tasks."""
         return self._initialized(project).root
+
+    def run_events(self, project: Path, run_id: str, from_sequence: int, limit: int) -> EventPage:
+        """A page of run ``run_id``'s journal, once the project is known to have the run."""
+        root, runs = self.runs(project)
+        if all(run.run_id != run_id for run in runs):
+            message = f"{root} has no run {run_id!r}"
+            raise ProjectLookupError(HelperErrorCode.UNKNOWN_RUN, str(root), message)
+        journal = Project.log_directory_for(root, run_id) / RUN_EVENTS_FILE
+        try:
+            with journal.open("rb") as lines:
+                return event_page(lines, from_sequence, limit, RUN_EVENTS_READ_MAX_BYTES)
+        except FileNotFoundError:
+            return EventPage((), from_sequence, complete=True)
 
     def _open(self, project: Path) -> Project:
         try:
@@ -283,10 +301,10 @@ class StoreLogReader:
     """The helper's ``LogReader`` over each run's ``vs_logs`` store on this host.
 
     ``locate`` names the run an instance drives or drove (``None`` when the host knows
-    nothing of it); ``directory_for`` names that run's store. Each call opens the store
-    afresh, so the helper keeps no state between requests. ``vs_logs.read`` is imported
-    on the first logs request, so a channel that never asks for logs, and every
-    ``hello``, loads none of it (``tests/e2e/test_host_helper.py`` holds the ceiling).
+    nothing of it); ``directory_for`` names that run's store. Each request opens the
+    store afresh (``instance``), so the helper keeps no state between requests.
+    ``vs_logs.read`` is imported on the first logs request, so a channel that never asks
+    for logs, and every ``hello``, loads none of it (``tests/e2e/test_host_helper.py`` holds the ceiling).
     """
 
     def __init__(
@@ -298,7 +316,38 @@ class StoreLogReader:
         self._locate = locate
         self._directory_for = directory_for
 
-    def streams(self, instance_id: str) -> tuple[LogStream, ...]:
+    def instance(self, instance_id: str) -> _StoreInstanceLogs:
+        """The instance's run's store, opened; ``UnknownInstanceError`` for an unknown run."""
+        location = self._locate(instance_id)
+        if location is None:
+            raise UnknownInstanceError(instance_id)
+        # lint-waiver: LW-640282 [PLC0415]; logs cost the helper nothing until a client reads one.
+        # > The same deferral as in `read`: `hello` must not load vs_logs.read, and an import
+        # > tach can see keeps its visibility rule enforced.
+        from vs_logs.read import CorruptLogError, open_log_directory  # noqa: PLC0415
+
+        reader = open_log_directory(self._directory_for(location), _OWNER)
+        return _StoreInstanceLogs(reader, CorruptLogError)
+
+
+class _StoreInstanceLogs:
+    """One run's ``vs_logs`` store, opened: each read sees what was written since.
+
+    An index that does not decode (``corrupt``, ``vs_logs.read.CorruptLogError`` passed in
+    so this module still loads none of ``vs_logs``) is ``LogStoreCorruptError``.
+    """
+
+    def __init__(self, reader: StoreReader[LogOwner], corrupt: type[Exception]) -> None:
+        self._reader = reader
+        self._corrupt = corrupt
+
+    def _using[T](self, use: Callable[[StoreReader[LogOwner]], T]) -> T:
+        try:
+            return use(self._reader)
+        except self._corrupt as error:
+            raise LogStoreCorruptError(str(error)) from error
+
+    def streams(self) -> tuple[LogStream, ...]:
         """The instance's streams, oldest first; none when its run recorded no logs."""
         return tuple(
             LogStream(
@@ -309,12 +358,10 @@ class StoreLogReader:
                 size=info.size,
                 outcome=None if info.outcome is None else LogStreamOutcome(info.outcome.value),
             )
-            for info in self._reader(instance_id).list_streams()
+            for info in self._using(lambda reader: reader.list_streams())
         )
 
-    def read(
-        self, instance_id: str, stream_id: str, start: LogOffset | LogTail, max_bytes: int
-    ) -> StoredBytes:
+    def read(self, stream_id: str, start: LogOffset | LogTail, max_bytes: int) -> StoredBytes:
         """At most ``max_bytes`` of the stream from ``start``."""
         # lint-waiver: LW-640281 [PLC0415]; logs cost the helper nothing until a client reads one.
         # > At module level every channel would load vs_logs.read before `hello`, which the
@@ -322,12 +369,11 @@ class StoreLogReader:
         # > the import from tach, which keeps vs_logs.read visible to the host helper only.
         from vs_logs.read import FromOffset, Tail, UnknownStreamError  # noqa: PLC0415
 
-        reader = self._reader(instance_id)
         origin = (
             FromOffset(start.offset) if isinstance(start, LogOffset) else Tail(start.tail_bytes)
         )
         try:
-            chunk = reader.read(stream_id, origin, max_bytes)
+            chunk = self._using(lambda reader: reader.read(stream_id, origin, max_bytes))
         except UnknownStreamError as error:
             raise UnknownLogStreamError(stream_id) from error
         return StoredBytes(
@@ -342,14 +388,3 @@ class StoreLogReader:
             eof=chunk.eof,
             closed=chunk.closed,
         )
-
-    def _reader(self, instance_id: str) -> StoreReader[LogOwner]:
-        location = self._locate(instance_id)
-        if location is None:
-            raise UnknownInstanceError(instance_id)
-        # lint-waiver: LW-640282 [PLC0415]; logs cost the helper nothing until a client reads one.
-        # > The same deferral as in `read`: `hello` must not load vs_logs.read, and an import
-        # > tach can see keeps its visibility rule enforced.
-        from vs_logs.read import open_log_directory  # noqa: PLC0415
-
-        return open_log_directory(self._directory_for(location), _OWNER)

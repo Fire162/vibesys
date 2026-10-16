@@ -34,7 +34,6 @@ from vs_agent.agent_feature import AGENT_USER, AGENT_WORKDIR, agent_feature
 from vs_decode.api import decode_json
 from vs_sandbox.api import FeatureImageBuildError, FinalImage, build_feature_image
 from vs_sim.api import (
-    DISCARD,
     Clock,
     Lines,
     OsThreads,
@@ -509,7 +508,7 @@ class DockerBuildRunner(Protocol):
         *,
         cwd: Path,
         timeout: float,
-        output: OutputSink = DISCARD,
+        output: OutputSink,
     ) -> DockerBuildResult:
         """Run one Docker command without a shell.
 
@@ -524,9 +523,11 @@ class DockerBuildRunner(Protocol):
 class _GuardedSink:
     """Forward drained chunks to the caller's sink, keeping its first failure for later.
 
-    A drain keeps reading after the sink fails: a drain that stopped would leave the
-    child blocked on a full pipe until its timeout. The failure is raised once both
-    pipes have drained, and the sink receives nothing after it.
+    By the ``OutputSink`` contract a sink never raises (a log stream degrades instead),
+    so a failure here is a programming error in the sink, which aborts the build. The
+    guard only decides how: a drain keeps reading after the sink fails, since a drain
+    that stopped would leave the child blocked on a full pipe until its timeout, and the
+    failure is raised once both pipes have drained. The sink receives nothing after it.
     """
 
     def __init__(self, sink: OutputSink, errors: queue.SimpleQueue[Exception]) -> None:
@@ -605,7 +606,7 @@ class SubprocessDockerBuildRunner:
         *,
         cwd: Path,
         timeout: float,
-        output: OutputSink = DISCARD,
+        output: OutputSink,
     ) -> DockerCommandResult:
         """Run one command with continuously drained, bounded output.
 
@@ -780,7 +781,7 @@ def build_task_image(  # noqa: PLR0913
     command_runner: DockerBuildRunner | None = None,
     timeout: float = _DEFAULT_BUILD_TIMEOUT_SECONDS,
     on_progress: BuildProgressSink | None = None,
-    output: OutputSink = DISCARD,
+    output: OutputSink,
     clock: Clock,
 ) -> str:
     """Build a task Dockerfile and return its immutable Docker image ID.
@@ -952,7 +953,7 @@ def agent_image(  # noqa: PLR0913  # lint-waiver: LW-011126 [PLR0913]; Base/task
     command_runner: DockerBuildRunner | None = None,
     timeout: float = _DEFAULT_BUILD_TIMEOUT_SECONDS,
     on_progress: BuildProgressSink | None = None,
-    output: OutputSink = DISCARD,
+    output: OutputSink,
     clock: Clock,
 ) -> str:
     """Build the agent layer on top of a task image, and return its image ID.
@@ -1036,8 +1037,8 @@ class _BuildRun:
     runner: DockerBuildRunner
     timeout: float
     clock: Clock
+    output: OutputSink
     on_progress: BuildProgressSink | None = None
-    output: OutputSink = DISCARD
     started: float = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1251,7 +1252,7 @@ def push_agent_image(
     repository: str = DEFAULT_AGENT_IMAGE_REGISTRY,
     command_runner: DockerBuildRunner | None = None,
     timeout: float = _DEFAULT_PUSH_TIMEOUT_SECONDS,
-    output: OutputSink = DISCARD,
+    output: OutputSink,
 ) -> str:
     """Tag, push, and resolve the pullable digest reference for *image_id*.
 
@@ -1329,7 +1330,7 @@ def agent_image_is_pushed(
     *,
     command_runner: DockerBuildRunner | None = None,
     timeout: float = _DEFAULT_VERIFY_TIMEOUT_SECONDS,
-    output: OutputSink = DISCARD,
+    output: OutputSink,
 ) -> bool:
     """Return whether *reference* (a ``repository@sha256:...`` digest) is live in its registry.
 
@@ -1361,7 +1362,7 @@ def ensure_pushed(
     repository: str = DEFAULT_AGENT_IMAGE_REGISTRY,
     command_runner: DockerBuildRunner | None = None,
     timeout: float = _DEFAULT_PUSH_TIMEOUT_SECONDS,
-    output: OutputSink = DISCARD,
+    output: OutputSink,
 ) -> str:
     """Return a pullable ``repository@sha256:...`` reference for *image_id*, pushing only if needed.
 

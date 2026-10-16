@@ -41,6 +41,14 @@ from vibesys.metrics import Objective
 from vibesys.orchestration.dynamic.search.api import (
     Blocker,
     BlockerKind,
+    EvaluationQueueView,
+    Expectation,
+    HandoffNote,
+    MainMeasurement,
+    MergeableRow,
+    MergeOutcome,
+    MergeRecord,
+    MergeSource,
     PlannerPrompt,
     ReviewEvaluation,
 )
@@ -276,6 +284,7 @@ def representative_context() -> dict[str, object]:
     # True renders the optional evaluation section of the core-policy prompts.
     context["agent_evaluation"] = True
     for name in [
+        "baseline_pending",
         "framework_benchmark_enabled",
         "framework_revert_applied",
         "gate_revalidation_pending",
@@ -313,6 +322,7 @@ def representative_context() -> dict[str, object]:
         "checkpoint",
         "ended_by",
         "input_failure",
+        "input_overdue",
         "invalid_type",
         "omitted",
         "portfolio_view",
@@ -514,6 +524,7 @@ def core_policy_context() -> dict[str, object]:
         remaining=3,
         base_revision=revision,
         base_accuracy_passed=True,
+        main_revision=revision,
         offer_snapshot="fixture-offer",
         older_ids=(),
         baseline=(),
@@ -577,6 +588,45 @@ def core_policy_context() -> dict[str, object]:
         # A correction names the request it repeats; the template only asks whether it is set.
         "of": "planning request",
         "turns_without_candidate": 2,
+        # The outline turn of a plan-mode run cites the plan's documents (a staged input here).
+        "documents": ("reference/reference.py",),
+        # The handoff file of one planning call (`WriteHandoff`'s fields).
+        "handoff_paths": (".vibesys/state/runs/run-1/orchestrator-handoff/calls/call-0001.md",),
+        "call": 1,
+        "reasoning": "Batch the decode loop first.",
+        "scheduled": (),
+        "updates": (),
+        "handoff": HandoffNote(
+            expectations=(
+                Expectation(
+                    work_id="h1",
+                    expected="Throughput rises.",
+                    if_it_succeeds="Merge it.",
+                    if_it_fails="Profile the queue.",
+                ),
+            ),
+            doubts=("The benchmark may be noisy.",),
+        ),
+        # The run's main and its merges (`MergePrompt` and the planner's main fields).
+        "main_revision": revision,
+        "main_measurement": MainMeasurement(revision=revision, merge_id="m1", accuracy_passed=True),
+        "merge_running": "m2",
+        "mergeable": (MergeableRow(hypothesis_id="h1", revision=revision),),
+        "merges": (
+            MergeRecord(
+                merge_id="m1",
+                sequence=2,
+                candidates=(MergeSource(hypothesis_id="h1", revision=revision),),
+                base=revision,
+                outcome=MergeOutcome.REFUSED,
+                reason="The two changes rewrite the same kernel.",
+            ),
+        ),
+        "rebase_onto": revision,
+        "merge_id": "m1",
+        "candidates": (MergeSource(hypothesis_id="h1", revision=revision),),
+        "instructions": "Apply h1, then h2.",
+        "watch_for": "Both change the scheduler.",
         # The issue queue's typed contexts.
         "board": (
             IssueBrief(id=1, type="feature", status="open", title="Add streaming", attempts=0),
@@ -650,6 +700,12 @@ def template_context(
     if path.parent.name == "_progress" and path.name == "profile.j2":
         values["summary"] = ProfilerSummary(
             analysis="Measured queue.", bottlenecks="Queue.", suggestions="Batch."
+        )
+    if path.name == "portfolio.j2":
+        # The portfolio template reads `evaluations` as the evaluation queue; the review
+        # templates read the same name as a candidate's evaluations.
+        values["evaluations"] = EvaluationQueueView(
+            pick="ranked", slots=1, input_holds_slot=True, ranking=("w1",)
         )
     if "response" in free:
         values["response"] = response_for(path)

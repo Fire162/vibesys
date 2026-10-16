@@ -9,8 +9,8 @@ import {
   type CompletionAction,
   completionStep,
   hostInitial,
-  INSPECTOR_CLOSED,
-  type InspectorAction,
+  INSPECTOR_SHEET_CLOSED,
+  type InspectorSheetAction,
   PICKER_CLOSED,
 } from '@vibesys/feature-hosts/state';
 import {LISTS_EMPTY} from '@vibesys/feature-recent-runs/state';
@@ -18,7 +18,7 @@ import {WELCOME_INITIAL} from '@vibesys/feature-run-control/state';
 import {START_CLOSED, type StartAction, startStep} from '@vibesys/feature-start-run/state';
 import type {HostListing} from '@vibesys/hosts';
 import type {RecentRun} from '@vibesys/runs';
-import {Dialog} from '@vibesys/ui';
+import {Dialog} from '@vibesys/ui/legacy';
 import {Window} from 'happy-dom';
 import {act} from 'react';
 import type {Root} from 'react-dom/client';
@@ -79,7 +79,7 @@ async function mountWelcome(): Promise<{readonly root: Root; readonly container:
     start: opened,
     picker: PICKER_CLOSED,
     completion: COMPLETION_EMPTY,
-    inspector: INSPECTOR_CLOSED,
+    inspector: INSPECTOR_SHEET_CLOSED,
     send: {
       welcome: () => undefined,
       host: () => undefined,
@@ -183,7 +183,7 @@ test('a retained recent locator stays inspectable while its host listing is unav
     const container = document.createElement('div');
     document.body.append(container);
     const root = createRoot(container);
-    const inspections: InspectorAction[] = [];
+    const inspections: InspectorSheetAction[] = [];
     const props: WelcomeViewProps = {
       welcome: WELCOME_INITIAL,
       lists: {
@@ -194,7 +194,7 @@ test('a retained recent locator stays inspectable while its host listing is unav
       start: START_CLOSED,
       picker: PICKER_CLOSED,
       completion: COMPLETION_EMPTY,
-      inspector: INSPECTOR_CLOSED,
+      inspector: INSPECTOR_SHEET_CLOSED,
       send: {
         welcome: () => undefined,
         host: () => undefined,

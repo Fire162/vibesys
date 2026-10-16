@@ -50,6 +50,7 @@
       "@vibesys/run-state/performance": ["libs/run-state/src/performance/index.ts"],
       "@vibesys/run-state/rounds": ["libs/run-state/src/rounds/index.ts"],
       "@vibesys/run-state/transcript": ["libs/run-state/src/transcript/index.ts"],
+      "@vibesys/run-state/trace": ["libs/run-state/src/trace/index.ts"],
       "@vibesys/runs": ["libs/runs/src/index.ts"],
       "@vibesys/settings": ["libs/settings/src/index.ts"],
       "@vibesys/settings/testing": ["libs/settings/src/testing/index.ts"],
@@ -57,9 +58,14 @@
       "@vibesys/store/testing": ["libs/store/src/testing/index.ts"],
       "@vibesys/transport": ["libs/transport/src/index.ts"],
       "@vibesys/transport-node": ["libs/transport-node/src/index.ts"],
+      "@vibesys/transport-node/testing": ["libs/transport-node/src/testing/index.ts"],
       "@vibesys/transport/testing": ["libs/transport/src/testing/index.ts"],
       "@vibesys/transport/websocket": ["libs/transport/src/websocket.ts"],
       "@vibesys/ui": ["libs/ui/src/index.ts"],
+      "@vibesys/ui/components.css": ["libs/ui/src/components.css"],
+      "@vibesys/ui/fonts.css": ["libs/ui/src/fonts.css"],
+      "@vibesys/ui/legacy": ["libs/ui/src/legacy/index.ts"],
+      "@vibesys/ui/tokens": ["libs/ui/src/tokens/index.ts"],
       "@vibesys/ui/tokens.css": ["libs/ui/src/tokens.css"]
     }
   }

@@ -7,10 +7,14 @@
  * - **One writer.** Every update goes through this store, one at a time across both files, so an
  *   update always reads what the one before it wrote and none drops another's change. With the
  *   app's single-instance lock (`apps/desktop-main`), no other process writes these files.
- * - **Atomic replace.** The text goes to a sibling file first and is renamed over the target, so a
- *   reader sees the old file or the new one, never a partial write.
+ * - **Atomic replacement with platform durability.** The text goes to a sibling file and is
+ *   flushed before it is renamed over the target, so a reader sees the old file or the new one,
+ *   never a partial write. POSIX systems also flush the parent directory before success. Node does
+ *   not expose that operation on Windows, where a successful update promises atomic visibility but
+ *   not crash-durable publication of the renamed directory entry.
  * - **Changes are announced.** `onRecentChanged` listeners hear every update of the recent runs, so
- *   no view has a refresh path to forget.
+ *   no view has a refresh path to forget. A failing listener is logged without skipping the other
+ *   listeners or changing the outcome of an update that already committed.
  * - **Invalid files are ignored by reads and reported** in the same host-settings snapshot; updates
  *   reject them before writing, so the bytes remain available for repair.
  *
@@ -18,6 +22,7 @@
  */
 import {randomUUID} from 'node:crypto';
 import {open, readFile, rename, unlink} from 'node:fs/promises';
+import {dirname} from 'node:path';
 import {EMPTY_SETTINGS, parseSettings, type SettingsFile} from './host-settings.js';
 import {EMPTY_RECENT, parseRecent, type RecentFile} from './recent.js';
 
@@ -28,13 +33,30 @@ export interface SettingsStoreOptions {
   readonly filesystem?: SettingsFilesystem;
 }
 
-/** The filesystem operations needed to read and atomically replace settings files. */
+/** The filesystem operations needed to read and safely replace settings files. */
 export interface SettingsFilesystem {
   readText(path: string): Promise<string>;
-  /** Create a complete private regular file exclusively beside `target` and return its path. */
-  stagePrivateText(target: string, text: string): Promise<string>;
+  /** Create and file-sync a complete private regular file exclusively beside `target`. */
+  stageDurablePrivateText(target: string, text: string): Promise<string>;
   remove(path: string): Promise<void>;
-  replace(staging: string, target: string): Promise<void>;
+  /**
+   * Atomically replace `target`, performing the implementation's available namespace-durability
+   * operation before resolving. POSIX implementations sync the parent directory. The Node Windows
+   * implementation resolves after rename because Node exposes no directory-sync capability there.
+   *
+   * A rejection does not promise rollback: rename may have succeeded before the directory sync
+   * failed, so the replacement may already be visible even though its crash outcome is unknown.
+   */
+  replaceAtomically(staging: string, target: string): Promise<void>;
+}
+
+/** Whether this Node runtime can flush a renamed entry's parent directory. */
+export type DirectorySyncCapability =
+  | {readonly kind: 'available'; readonly sync: (directory: string) => Promise<void>}
+  | {readonly kind: 'unavailable'};
+
+export interface NodeSettingsFilesystemOptions {
+  readonly directorySync?: DirectorySyncCapability;
 }
 
 interface ReadResult<T> {
@@ -78,7 +100,7 @@ export class SettingsStore {
     }
     if (read.kind === 'failed') {
       const failure = readFailure(this.#options.settingsPath, read.error);
-      this.#options.log(failure.message);
+      this.#log(failure.message);
       return {value: EMPTY_SETTINGS, failure};
     }
     try {
@@ -86,7 +108,7 @@ export class SettingsStore {
       return {value: parsed, failure: null};
     } catch (error) {
       const failure = invalidFile(this.#options.settingsPath, error);
-      this.#options.log(`ignoring ${failure.message}`);
+      this.#log(`ignoring ${failure.message}`);
       return {value: EMPTY_SETTINGS, failure};
     }
   }
@@ -101,14 +123,14 @@ export class SettingsStore {
     if (read.kind === 'missing') return {value: EMPTY_RECENT, failure: null};
     if (read.kind === 'failed') {
       const failure = readFailure(this.#options.recentPath, read.error);
-      this.#options.log(failure.message);
+      this.#log(failure.message);
       return {value: EMPTY_RECENT, failure};
     }
     try {
       return {value: parseRecent(JSON.parse(read.text) as unknown), failure: null};
     } catch (error) {
       const failure = invalidFile(this.#options.recentPath, error);
-      this.#options.log(`ignoring ${failure.message}`);
+      this.#log(`ignoring ${failure.message}`);
       return {value: EMPTY_RECENT, failure};
     }
   }
@@ -117,7 +139,7 @@ export class SettingsStore {
    * Replace the host settings with `update` of the current ones. `current` is checked at the
    * atomic-replace boundary so a cancelled checkout validation cannot commit staged settings.
    * The outcome makes that boundary explicit: after `committed`, later cancellation cannot revoke
-   * the durable write.
+   * the installed replacement. Crash durability follows the platform guarantee documented above.
    */
   updateHosts(
     update: (current: SettingsFile) => SettingsFile,
@@ -147,14 +169,40 @@ export class SettingsStore {
         (await writeJson(this.#filesystem, this.#options.recentPath, next, current)) === 'cancelled'
       )
         return;
-      for (const listener of this.#recentListeners) listener(next);
+      this.#notifyRecent(next);
     });
   }
 
-  /** Hear every update of the recent runs; returns the unsubscribe. */
+  /** Hear every update; failures are reported after commit and results are not awaited. */
   onRecentChanged(listener: (recent: RecentFile) => void): () => void {
     this.#recentListeners.add(listener);
     return () => this.#recentListeners.delete(listener);
+  }
+
+  /** Deliver a committed value without letting a non-owning observer rewrite its outcome. */
+  #notifyRecent(recent: RecentFile): void {
+    for (const listener of [...this.#recentListeners]) {
+      try {
+        const notified = listener(recent);
+        void Promise.resolve(notified).catch(error => {
+          this.#log(`could not notify a recent-runs listener: ${errorMessage(error)}`);
+        });
+      } catch (error) {
+        this.#log(`could not notify a recent-runs listener: ${errorMessage(error)}`);
+      }
+    }
+  }
+
+  /** Diagnostics are fire-and-forget and cannot change a durable read or update outcome. */
+  #log(message: string): void {
+    try {
+      const logged = this.#options.log(message);
+      void Promise.resolve(logged).catch(() => {
+        // The diagnostic has no later owner; consume its rejected thenable here.
+      });
+    } catch {
+      // Diagnostics cannot replace the settings result or the failure being reported.
+    }
   }
 
   #serialize<T>(write: () => Promise<T>): Promise<T> {
@@ -167,17 +215,48 @@ export class SettingsStore {
   }
 }
 
+function errorMessage(error: unknown): string {
+  try {
+    return error instanceof Error ? String(error.message) : String(error);
+  } catch {
+    return 'an unprintable failure';
+  }
+}
+
 type TextRead =
   | {readonly kind: 'text'; readonly text: string}
   | {readonly kind: 'missing'}
   | {readonly kind: 'failed'; readonly error: unknown};
 
-const NODE_SETTINGS_FILESYSTEM: SettingsFilesystem = {
-  readText: path => readFile(path, 'utf8'),
-  stagePrivateText: (target, text) => stagePrivateText(target, text, 0o600),
-  remove: unlink,
-  replace: rename,
-};
+/** The Node implementation; its capability is injectable so platform branches are deterministic. */
+export class NodeSettingsFilesystem implements SettingsFilesystem {
+  readonly #directorySync: DirectorySyncCapability;
+
+  constructor(options: NodeSettingsFilesystemOptions = {}) {
+    this.#directorySync = options.directorySync ?? nodeDirectorySync(process.platform);
+  }
+
+  readText(path: string): Promise<string> {
+    return readFile(path, 'utf8');
+  }
+
+  stageDurablePrivateText(target: string, text: string): Promise<string> {
+    return stagePrivateText(target, text, 0o600);
+  }
+
+  async remove(path: string): Promise<void> {
+    await unlink(path);
+  }
+
+  async replaceAtomically(staging: string, target: string): Promise<void> {
+    await rename(staging, target);
+    if (this.#directorySync.kind === 'available') {
+      await this.#directorySync.sync(dirname(target));
+    }
+  }
+}
+
+const NODE_SETTINGS_FILESYSTEM: SettingsFilesystem = new NodeSettingsFilesystem();
 
 const MAX_STAGING_ATTEMPTS = 8;
 
@@ -203,10 +282,26 @@ async function writeNewPrivateText(path: string, text: string, mode: number): Pr
     await file.writeFile(text);
     // Creation mode is umask-sensitive; chmod the owned descriptor to make the contract exact.
     await file.chmod(mode);
+    await file.sync();
     await file.close();
   } catch (error) {
     await file.close().catch(() => {});
     await unlink(path).catch(() => {});
+    throw error;
+  }
+}
+
+function nodeDirectorySync(platform: NodeJS.Platform): DirectorySyncCapability {
+  return platform === 'win32' ? {kind: 'unavailable'} : {kind: 'available', sync: syncDirectory};
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  const directory = await open(path, 'r');
+  try {
+    await directory.sync();
+    await directory.close();
+  } catch (error) {
+    await directory.close().catch(() => {});
     throw error;
   }
 }
@@ -236,20 +331,23 @@ function invalidFile(path: string, cause: unknown): Error {
   return new Error(`${path}: ${detail}`, {cause});
 }
 
-/** Replace `path` with `value` as JSON, private to the user, atomically (write aside, rename). */
+/** Replace `path` with private JSON (write aside, file sync, atomic rename, platform durability). */
 async function writeJson(
   filesystem: SettingsFilesystem,
   path: string,
   value: unknown,
   current: () => boolean = () => true,
 ): Promise<SettingsUpdateOutcome> {
-  const staging = await filesystem.stagePrivateText(path, `${JSON.stringify(value, null, 2)}\n`);
+  const staging = await filesystem.stageDurablePrivateText(
+    path,
+    `${JSON.stringify(value, null, 2)}\n`,
+  );
   try {
     if (!current()) {
       await filesystem.remove(staging);
       return 'cancelled';
     }
-    await filesystem.replace(staging, path);
+    await filesystem.replaceAtomically(staging, path);
   } catch (error) {
     // Best effort: a failed cleanup must not hide the operation or commit-guard failure.
     await filesystem.remove(staging).catch(() => {});

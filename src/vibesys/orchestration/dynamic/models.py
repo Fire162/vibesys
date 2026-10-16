@@ -18,6 +18,7 @@ from pydantic.json_schema import GenerateJsonSchema
 
 from vibesys.hypothesis import HypothesisOutcome
 from vibesys.hypothesis.plan import HypothesisStrategyUpdate
+from vibesys.inputs import MAX_STEPS, PlanStep, outline_problems
 from vs_core.api import RevisionReply, Value
 from vs_runtime.api import (
     AgentId,
@@ -75,6 +76,8 @@ class WorkstreamKind(StrEnum):
     IMPLEMENT = "implement"
     # Profile an existing candidate revision to inform later plans.
     PROFILE = "profile"
+    # Merge candidates into the run's main revision.
+    MERGE = "merge"
 
 
 class WorkstreamPlan(BaseModel):
@@ -204,6 +207,57 @@ class ProfileDecision(ProfilePlan):
     )
 
 
+MAX_MERGE_CANDIDATES = 8
+"""The most candidates one merge may combine."""
+
+
+class MergePlan(BaseModel):
+    """Merge buildable candidates into the run's main revision, in the order given.
+
+    A merge agent applies them on a checkout of main, resolves conflicts and runs the project's
+    fast tests; its commit is then measured and becomes main when it passes the trusted accuracy
+    check and measures no worse than main. It may not redesign:
+    when the instructions cannot be followed it stops and says why.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal[WorkstreamKind.MERGE] = Field(
+        description="Use merge to combine buildable candidates into the run's main revision."
+    )
+    merge_id: AgentId = Field(
+        description="A new ID for this merge, distinct from every hypothesis, profile and merge ID."
+    )
+    candidates: tuple[AgentId, ...] = Field(
+        min_length=1,
+        max_length=MAX_MERGE_CANDIDATES,
+        description=(
+            "Hypothesis IDs of listed buildable candidates, in the order to merge them; each "
+            "is merged at its latest verified revision."
+        ),
+    )
+    instructions: str = Field(
+        min_length=1,
+        description=(
+            "How to merge them: which changes add up, which of two alternatives to take, which "
+            "parts duplicate main and are dropped."
+        ),
+    )
+    watch_for: str = Field(
+        min_length=1,
+        description="What the merger must check or be careful of while merging.",
+    )
+
+    @field_validator("instructions", "watch_for")
+    @classmethod
+    def _nonblank_intent(cls, value: str) -> str:
+        """Require meaningful merge instructions without rewriting the planner's text."""
+        if not value.strip():
+            message = "merge instructions must not be blank"
+            raise ValueError(message)
+        return value
+
+
 def _workstream_kind(value: object) -> str:
     """Return a planned workstream's kind; an entry without one is an implement workstream."""
     if isinstance(value, dict):
@@ -217,7 +271,8 @@ def _workstream_kind(value: object) -> str:
 # workstreams existed still validate.
 type PlannedWorkstream = Annotated[
     Annotated[WorkstreamPlan, Tag(WorkstreamKind.IMPLEMENT.value)]
-    | Annotated[ProfilePlan, Tag(WorkstreamKind.PROFILE.value)],
+    | Annotated[ProfilePlan, Tag(WorkstreamKind.PROFILE.value)]
+    | Annotated[MergePlan, Tag(WorkstreamKind.MERGE.value)],
     Discriminator(_workstream_kind),
 ]
 
@@ -225,7 +280,8 @@ type PlannedWorkstream = Annotated[
 # original contract so a resume never invents intent for an older profile.
 type PlannerWorkstream = Annotated[
     Annotated[WorkstreamPlan, Tag(WorkstreamKind.IMPLEMENT.value)]
-    | Annotated[ProfileDecision, Tag(WorkstreamKind.PROFILE.value)],
+    | Annotated[ProfileDecision, Tag(WorkstreamKind.PROFILE.value)]
+    | Annotated[MergePlan, Tag(WorkstreamKind.MERGE.value)],
     Discriminator(_workstream_kind),
 ]
 
@@ -252,6 +308,8 @@ def planned_id(plan: PlannedWorkstream) -> str:
     """Return the ID a planned workstream is scheduled and tracked under."""
     if isinstance(plan, ProfilePlan):
         return plan.profile_id
+    if isinstance(plan, MergePlan):
+        return plan.merge_id
     return plan.hypothesis_id
 
 
@@ -273,6 +331,42 @@ class PlannerHypothesisUpdate(HypothesisStrategyUpdate):
     )
 
 
+class WorkstreamExpectation(BaseModel):
+    """What the planner expects of one workstream it scheduled, and what it would do next."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    work_id: AgentId = Field(
+        description="The hypothesis or profile ID of a workstream of this reply."
+    )
+    expected: str = Field(min_length=1, description="What you expect this workstream to show.")
+    if_it_succeeds: str = Field(
+        min_length=1, description="What you would plan next if it shows what you expect."
+    )
+    if_it_fails: str = Field(
+        min_length=1, description="What you would plan next if it fails or shows the opposite."
+    )
+
+
+class PlannerHandoff(BaseModel):
+    """The planner's note to the planner of a later turn, which starts with no memory of this one.
+
+    Core writes it, with the plan's reasoning and workstreams, to a handoff file in the run's
+    state; later planning prompts list that file's path.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    expectations: tuple[WorkstreamExpectation, ...] = Field(
+        max_length=32,
+        description="One entry per workstream of this reply: what you expect and what follows.",
+    )
+    doubts: tuple[str, ...] = Field(
+        max_length=16,
+        description="What you are unsure of and would check next; empty when there is nothing.",
+    )
+
+
 class PortfolioPlan(BaseModel):
     """A bounded batch of distinct hypothesis workstreams."""
 
@@ -283,14 +377,29 @@ class PortfolioPlan(BaseModel):
         min_length=1,
         max_length=32,
         description=(
-            "The new workstreams to start: one entry per hypothesis (kind implement) "
-            "or per profile (kind profile)."
+            "The new workstreams to start: one entry per hypothesis (kind implement), "
+            "per profile (kind profile) or per merge (kind merge)."
         ),
     )
     hypothesis_updates: tuple[PlannerHypothesisUpdate, ...] = Field(
         default=(),
         max_length=32,
         description="Parks and abandonments of completed hypotheses; empty when there are none.",
+    )
+    handoff: PlannerHandoff = Field(
+        description=(
+            "Your note to the next planner, who starts without your memory: what you expect "
+            "of each workstream, what you would do next on each outcome, and your open doubts."
+        )
+    )
+    evaluation_order: tuple[str, ...] = Field(
+        default=(),
+        max_length=64,
+        description=(
+            "The hypothesis or profile IDs whose waiting candidates a free trusted evaluation "
+            "slot measures first, first to measure first; empty to leave the order as it is. "
+            "Only read when the run lets the orchestrator rank its evaluations; ignored otherwise."
+        ),
     )
 
     @field_validator("reasoning")
@@ -342,7 +451,7 @@ class ImplementPortfolioPlan(PortfolioPlan):
         *,
         union_format: Literal["any_of", "primitive_type_array"] = "any_of",
     ) -> dict[str, Any]:
-        """Return the portfolio schema with implement workstreams as the only entry kind."""
+        """Return the portfolio schema with implement and merge workstreams as the entry kinds."""
         schema = super().model_json_schema(
             by_alias=by_alias,
             ref_template=ref_template,
@@ -355,8 +464,16 @@ class ImplementPortfolioPlan(PortfolioPlan):
         definitions = schema["$defs"]
         del definitions["PlannerWorkstream"], definitions["ProfileDecision"]
         workstreams = schema["properties"]["workstreams"]
-        workstreams["items"] = {"$ref": ref_template.format(model="WorkstreamPlan")}
-        workstreams["description"] = "The new workstreams to start: one entry per hypothesis."
+        workstreams["items"] = {
+            "anyOf": [
+                {"$ref": ref_template.format(model="WorkstreamPlan")},
+                {"$ref": ref_template.format(model="MergePlan")},
+            ]
+        }
+        workstreams["description"] = (
+            "The new workstreams to start: one entry per hypothesis (kind implement) or per "
+            "merge (kind merge)."
+        )
         return schema
 
 
@@ -483,8 +600,67 @@ class ImplementerResult(WorkResult, RevisionReply):
         return self.outcome is not HypothesisOutcome.BLOCKED
 
 
+class MergeOutcomeKind(StrEnum):
+    """How a merger ends its merge."""
+
+    MERGED = "merged"
+    REFUSED = "refused"
+
+
+class MergeResult(RevisionReply):
+    """What a merger answers: the merge it committed, or why it stopped without one."""
+
+    outcome: MergeOutcomeKind = Field(
+        description=(
+            "merged when every candidate is merged as instructed and the project's fast tests "
+            "pass; refused when the instructions cannot be followed without redesigning."
+        )
+    )
+    summary: str = Field(min_length=1, description="What you merged, in order, and how.")
+    tests: str = Field(
+        min_length=1,
+        description="The project's fast tests you ran on the merged tree, and their result.",
+    )
+    reason: str = Field(
+        default="",
+        description="For refused: which instruction could not be followed, and why. Else empty.",
+    )
+
+    @override
+    def produces_revision(self) -> bool:
+        """Only a merge that merged leaves a commit for core to checkpoint."""
+        return self.outcome is MergeOutcomeKind.MERGED
+
+
 class ProfilerResult(WorkResult):
     """What a profiler answers: it measures a revision and never produces one."""
+
+
+class PlanOutline(BaseModel):
+    """The steps of the task's plan, as the planner outlines them from the plan's documents.
+
+    The steps are checked by the rules a ``[plan]`` table's own steps are (`outline_problems`):
+    a reply that breaks one is corrected with the rule named.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    steps: tuple[PlanStep, ...] = Field(
+        min_length=1,
+        max_length=MAX_STEPS,
+        description=(
+            "The plan's steps in the order they should be implemented; each names the steps it "
+            "builds on."
+        ),
+    )
+
+    @field_validator("steps")
+    @classmethod
+    def _steps_form_a_plan(cls, steps: tuple[PlanStep, ...]) -> tuple[PlanStep, ...]:
+        problems = outline_problems(steps)
+        if problems:
+            raise ValueError("; ".join(problems))
+        return steps
 
 
 class ReviewResult(BaseModel):
@@ -503,7 +679,12 @@ __all__ = [
     "EvidenceReference",
     "ImplementPortfolioPlan",
     "ImplementerResult",
+    "MergeOutcomeKind",
+    "MergePlan",
+    "MergeResult",
+    "PlanOutline",
     "PlannedWorkstream",
+    "PlannerHandoff",
     "PlannerHypothesisUpdate",
     "PlannerWorkstream",
     "PortfolioPlan",
@@ -515,6 +696,7 @@ __all__ = [
     "ReviewResult",
     "StrategyReason",
     "WorkResult",
+    "WorkstreamExpectation",
     "WorkstreamKind",
     "WorkstreamPlan",
     "planned_id",

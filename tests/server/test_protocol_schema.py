@@ -3,6 +3,7 @@
 import copy
 import json
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -31,8 +32,10 @@ from server.api.schema import (
     run_event_typescript,
 )
 from server.events import EventData
+from server.events import GateKind as ServerGateKind
 from server.host_api import HelperFeature
-from vibesys.api import RunFailedData, RunFailure, ToolResultPayload
+from vibesys.api import GateKind, RunFailedData, RunFailure, ToolResultPayload
+from vs_logs.api import NarrationLevel, NarrationLine
 
 SCHEMA_PATH = Path("clients/libs/contracts/src/generated/protocol.schema.json")
 HOST_HELPER_SCHEMA_PATH = Path("clients/libs/contracts/src/generated/host-helper.schema.json")
@@ -86,6 +89,28 @@ def test_committed_protocol_schema_matches_python_contract() -> None:
     assert _committed_schema() == protocol_json_schema()
 
 
+@given(
+    level=st.sampled_from(list(NarrationLevel)),
+    message=st.text(max_size=20),
+    traceback=st.none() | st.text(max_size=20),
+)
+def test_committed_schema_accepts_every_narration_line_the_run_writes(
+    level: NarrationLevel, message: str, traceback: str | None
+) -> None:
+    """A log view decodes narration with the generated type: every written line must fit it."""
+    document = _committed_schema()
+    line = NarrationLine(
+        at=datetime(2026, 10, 15, tzinfo=UTC),
+        level=level,
+        logger="vibesys.run",
+        thread="MainThread",
+        message=message,
+        traceback=traceback,
+    )
+    schema = {**_definition(document, "#/$defs/NarrationLine"), "$defs": document["$defs"]}
+    Draft202012Validator(schema).validate(json.loads(line.model_dump_json()))
+
+
 def test_committed_host_helper_schema_matches_python_contract() -> None:
     assert json.loads(HOST_HELPER_SCHEMA_PATH.read_text()) == host_helper_json_schema()
 
@@ -130,18 +155,27 @@ def test_host_helper_schema_exports_the_authoritative_request_feature_gates() ->
         "paths.complete": "paths_complete",
         "logs.list": "logs",
         "logs.read": "logs",
+        "logs.cancel": "logs_cancel",
         "harnesses.list": "harnesses",
+        "runs.read_events": "run_history",
     }
     request_tags = document["properties"]["request"]["discriminator"]["mapping"]
     assert gates.keys() <= request_tags.keys()
-    assert set(gates.values()) == {feature.value for feature in HelperFeature}
+    field_gates = {
+        f for fields in document["x-vibesys-feature-by-field"].values() for f in fields.values()
+    }
+    # Every feature gates a method or an optional field of one.
+    assert set(gates.values()) | field_gates == {feature.value for feature in HelperFeature}
 
 
 def test_host_helper_schema_exports_the_authoritative_field_feature_gates() -> None:
     document = host_helper_json_schema()
     gates = document["x-vibesys-feature-by-field"]
 
-    assert gates == {"run.start": {"harness": "harnesses"}}
+    assert gates == {
+        "run.start": {"harness": "harnesses"},
+        "logs.list": {"span_id": "logs_by_span"},
+    }
     request_refs = document["properties"]["request"]["discriminator"]["mapping"]
     for tag, fields in gates.items():
         request = document["$defs"][request_refs[tag].rsplit("/", 1)[1]]
@@ -621,6 +655,11 @@ def test_wire_run_failure_is_the_core_contract() -> None:
     assert defs["RunFailure"]["required"] == core["required"]
     assert defs["RunFailureKind"]["enum"] == core["$defs"]["RunFailureKind"]["enum"]
     assert RunFailedData.model_fields["failure"].annotation is RunFailure
+
+
+def test_gate_kind_has_one_definition_on_both_wire_contracts() -> None:
+    """Run events and log owners share vibesys' GateKind, so one schema entry serves both."""
+    assert ServerGateKind is GateKind
 
 
 def test_thread_creation_request_no_longer_accepts_a_driver() -> None:

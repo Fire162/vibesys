@@ -139,7 +139,7 @@ function refusedArgument(start: Extract<HelperRequest, {type: 'run.start'}>): st
 
 export function record(id: string, runId: string, project = '/p'): LiveInstanceRecord {
   return {
-    version: 4,
+    version: 5,
     id,
     status: 'serving',
     phase: {status: 'running', stage: null, reason: null},
@@ -201,6 +201,8 @@ export class FakeHelper {
     'instances_inspect',
     'harnesses',
     'logs',
+    'logs_cancel',
+    'run_history',
   ]);
   /** The run log streams `logs.list` and `logs.read` serve; replace it to seed a store. */
   logStore = new FakeLogStore();
@@ -343,7 +345,7 @@ export class FakeHelper {
 
   listing(): InstanceList {
     return {
-      version: 4,
+      version: 5,
       instances: [...this.host.instances],
       ended: [...this.host.ended],
       unreadable: [...this.host.unreadable],
@@ -503,6 +505,9 @@ class HelperSession {
       case 'run.start':
         this.#start(request);
         return;
+      case 'runs.read_events':
+        this.#readEvents(request);
+        return;
       case 'harnesses.list':
         this.#send({
           type: 'harnesses.list',
@@ -522,6 +527,11 @@ class HelperSession {
       case 'logs.list':
       case 'logs.read':
         this.#logs(request);
+        return;
+      case 'logs.cancel':
+        // This helper answers every read at once, so the named read has always answered already
+        // (or never existed): the cancel's reply follows it, as the real helper's does.
+        this.#send({type: 'logs.cancel', request_id: id, read_id: request.read_id});
         return;
     }
   }
@@ -673,6 +683,19 @@ class HelperSession {
       }
     }
     this.#project(request);
+  }
+
+  /** The fake host records no runs, so every run of a known project is unknown. */
+  #readEvents(request: Extract<HelperRequest, {type: 'runs.read_events'}>): void {
+    const id = request.request_id;
+    if (!this.#helper.host.projects.has(request.project)) {
+      this.#send({...this.#error(id, 'project_missing', 'no such project'), path: request.project});
+      return;
+    }
+    this.#send({
+      ...this.#error(id, 'unknown_run', `${request.project} has no run '${request.run_id}'`),
+      path: request.project,
+    });
   }
 
   #project(

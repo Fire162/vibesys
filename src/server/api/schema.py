@@ -25,6 +25,7 @@ from server.host_api import (
     ChannelEnd,
     HelperMessage,
     HelperRequest,
+    RunStartCompensationFailure,
 )
 from vibesys.api import (
     IterationKind,
@@ -33,6 +34,7 @@ from vibesys.api import (
     IterationSummary,
     LogOwner,
 )
+from vs_logs.api import NarrationLine
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -112,6 +114,8 @@ class ProtocolDocument(BaseModel):
     server_message: ServerMessage
     log_owner: LogOwner
     """What a run's log stream is for; the host helper's log listing carries it."""
+    narration_line: NarrationLine
+    """One JSON line of a ``run_narration`` stream, which a log view decodes."""
 
 
 class HostHelperDocument(BaseModel):
@@ -122,6 +126,7 @@ class HostHelperDocument(BaseModel):
     request: HelperRequest
     message: HelperMessage
     channel_end: ChannelEnd
+    compensation_failure: RunStartCompensationFailure
 
 
 def host_helper_json_schema() -> dict[str, Any]:

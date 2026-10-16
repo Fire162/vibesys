@@ -30,6 +30,7 @@ There is no event list, no "uses" list and no state class. A search that asks ag
 role data). A search whose flows act on a system another library owns (an issue board) passes
 `owned=` (the codecs of that library's operations); `ctx.owners.perform` sends one and returns the
 typed outcome or a `Failed`, and the declaration requires the host to provide an owner for each.
+A search that labels its spans passes `spans=` (its `SpanKind` declarations; see "Span labels").
 The id scheme derives from the search name.
 
 The root flow starts with the config and returns `None` or `NoWinner(reason)`. **A flow never
@@ -73,6 +74,7 @@ outside world is an aspect.
 | `ctx.checkpoint(snapshot)` | Where a code change may resume this flow |
 | `ctx.choose(kept_or_INPUT)` | Name the current winner |
 | `ctx.publish(record)` | Make a typed record of the flow's progress visible outside |
+| `ctx.label(kind, title=..., links=..., attrs=..., verdict=..., reason=...)`, `ctx.span` | Label this flow's span; the span's id, for another span's link |
 | `ctx.facts`, `ctx.task`, `ctx.capabilities`, `ctx.clock.now()` | The run's facts and view (journaled reads); `ctx.task.run_id` keeps two runs' shared writes apart |
 | `ctx.agents.session(role, ...)` | A conversation with an agent; `await session.turn(prompt, within=s)` |
 | `ctx.workspaces.open(...)` | A workspace as a resource; `keep`, `verify`, `kept` |
@@ -152,6 +154,8 @@ A **source** is anything a flow can wait on for a value:
 | `Group[T]` | each finished task's result (or `TaskStopped(key)`), once each, in finishing order |
 | `ctx.timer(at)` | `TimeUp(at)`, once |
 | `ctx.stopped` | `StopRequested`, once |
+| `ctx.latch(key)` | the value some flow `set` on the run-wide latch `key` (once per run), once per handle |
+| `ctx.channel(key)` | each value any flow `send`s on the run-wide channel `key`, in the order sent, once; one flow reads it |
 
 **Every source yields each value once.** `await source` waits for its next value;
 `await ctx.first(a, b, c)` waits for the next value of whichever is ready first, and returns it
@@ -170,6 +174,45 @@ What a flow is waiting for is therefore always data: the runtime can say "ws-3 w
 implementer.2 or the stop" in logs and tests. A flow waiting only on sources that can never yield
 again (an empty group, a consumed stop, nothing pending) is a bug, raised as `Deadlock` with the
 flow and its sources named. Concurrent agent turns or measurements are tasks in a group.
+
+A **latch** carries a fact one flow learns to the flows beside it that need it, without passing
+it through their arguments (a registered flow takes only its snapshot). Declare its key once,
+typed by the value (`INPUT_MEASURED = LatchKey[Baseline]("input-measured")`); the flow that
+learns the fact calls `ctx.latch(INPUT_MEASURED).set(value)`, once (a second `set` is a
+`ContractError`), and a waiter calls `await ctx.latch(INPUT_MEASURED)`, which returns at once
+when it is already set. A key is its declaration: a second key with a name already in use is a
+`ContractError`, since the two could hold different types under one name.
+
+Latches belong to one journal and are not journaled. Replay runs the flow code again, so it sets
+them again at the same point. A restart after a code change starts a fresh journal from the flows'
+snapshots, and every latch starts empty: the flow that sets one must set it again, from its
+snapshot if it learned the value before the restart (`test_flows_restart.py` plays both orders).
+A latch that is never set is not a `Deadlock`; the waiter waits for its stop.
+
+A fact learned once per item (a verdict for each of many tasks) is one declaration with a latch
+per item: `ctx.latch(VERDICT.of(task_key))`. Every item key belongs to its declaration, so the
+flow that sets it and the flow that waits for it share the declared key, not an object.
+
+A **channel** carries facts the other way: many flows report, as they reach them, to the one flow
+that keeps their record (each workstream telling the root it waits for an evaluation slot).
+Declare its key once (`REPORTS = ChannelKey[Report]("reports")`); any flow calls
+`ctx.channel(REPORTS).send(value)`, and the reader waits on `ctx.channel(REPORTS)` in its
+`first`. Values are read in the order they were sent, each once. **A channel has one reader**:
+the first flow that waits on it reads it for the run, and a second flow that waits on it is a
+`ContractError`, since two readers would split its values by scheduling order. A flow that waits
+on an empty channel while no other flow is live waits for a value nobody can send, so the channel
+counts as unable to yield again toward a `Deadlock`; while another flow lives, it may still send.
+
+Like a latch, a channel is not journaled: replay sends again at the same points, and a restart
+after a code change starts it empty. **So never record a checkpoint between a send and the
+reader's receipt of what it implies.** A sender that checkpoints after its send resumes past it
+on a restart, so the reader, whose channel starts empty, never hears it; a reader that
+checkpoints after it read the value but before it folded it in loses the fact the same way. Send
+after the last checkpoint that a restart resumes from, as the dynamic search's workstreams do
+(they checkpoint only at their start, and every send is redone after a restart). Unenforced: a
+checkpoint and a send are ordinary calls in flow code, and which pairs matter depends on what the
+reader does with the value; `test_flows.py` plays every channel story restarted after each
+step, which catches a lost send in the flows it covers.
 
 ### Groups
 
@@ -229,6 +272,92 @@ and, with a backoff, waits on the run clock between them. `ctx.retry` returns th
 
 `ctx.publish(record)` replaces the flow's published record (a pydantic model): what status views,
 projections and tests read about a run in flight. It is kept in the state beside the journal.
+
+### The run trace
+
+The runtime records what the run's work did as **spans**, without the search doing anything: one
+span for each flow task (the root and every task a group starts) and one for each operation a flow
+awaits (an agent turn and its render, a workspace's start and settlement, a verification, a
+measurement and its interpretation, an owner operation, the adoption). Each is recorded at the
+point where the runtime already handles that transition, so a new operation kind or flow
+construct gets its span from the same few points.
+
+| Field | What it holds |
+|---|---|
+| `id` | `flow:<path>#<n>` for a task (`n` counts the tasks started at that path, since a key can be started again after its task ended; the root is `flow:#1`), `op:<decision id>` for an operation |
+| `parent` | the span of the flow that started the task or issued the operation (None for the root) |
+| `type`, `name` | `flow` with the flow's name, or `operation` with the operation's registered kind (or, for core's own requests, the id root core issued it under: the role's name for a turn, `measure`, `start`, `settle`, `adopt`...) |
+| `status` | `running` (an operation in flight, or a flow waiting on its own work: an operation, a turn, a task or a group), `waiting` (a flow waiting only on time, a latch or the stop), `pending` (a flow a code change restarts, until its parent starts its key again), `done`, `failed`, `stopped` |
+| `waiting_on` | one entry per source of the flow's current wait: `operation` (ref: the operation's span, or a turn's signal), `slot` (a task's span, `group`, or a latch), `time` (the timer), `stop`; `since` is when that wait began |
+| `attempts` | each try of `ctx.retry` in the flow: `n` of `of`, its times, and `done`, `again` (with the reason as text) or `gave_up` |
+| `started_at`, `ended_at` | run-clock times |
+| `failure` | `outcome` when a `failed` span ended with a failure value (an operation answered `Failed`, a task returned `Failed` or `GaveUp`, the run finished as a failure) and `interruption` when a `stopped` span was interrupted (the stop landed, the flow abandoned the operation, a code change dropped it, the run ended around it) |
+| `stop` | when the operator's stop reached this flow, and whether it `landed` (raised `Stopped` in it) |
+| `invocation` | for an agent turn, the invocation it ran as: how the runtime names the turn's span on the agent's own records (its usage) |
+| `label` | the search's label of the span (see "Span labels"), or None |
+
+**Determinism.** Every journal step records its run-clock time (`Step.at`, the host's `now_at`
+when it delivered the event); every span transition the step makes carries that time, and replay
+reads it back from the step. It is an input like the event, so it is not in the digest. Flow code
+is deterministic, so replaying a journal yields the same spans, ids and times. The spans are kept
+beside the live flows in the persisted state; a restart after a code change continues them: a
+registered flow resumes in its own span (pending until its parent starts its key again), and an
+operation in flight or a task that is not a registered flow ends `stopped` (a fresh start of that
+key gets the next `#n`). When the root issues the run's `Finish`, every span still open ends, and
+the root ends `done`, `failed` or `stopped` by the proposed result, so a finished run has no
+running or waiting span. A defect crashes the step that raised it, which is never persisted, so a
+trace holds no defect.
+
+The shell reads the spans as `FlowDriver.trace(state)`, a frozen `RunTrace` of `Span`s (exported
+from `vs_core.api`); `FlowState` itself stays private. Clients get the trace as span events and
+snapshot spans: see "Run trace events" in [wire-protocol.md](wire-protocol.md). `test_flows_trace.py` and the sweep in
+`test_flows_properties.py` check the properties, live and with a restart after every step.
+
+### Span labels
+
+Runtime spans say what ran; the search says what it means. It declares the kinds of span it
+labels at registration, as it declares roles:
+
+```python
+WORKSTREAM = SpanKind(
+    "workstream", attrs=WorkstreamAttrs, verdicts=("accepted", "rejected"), links=("builds_on",)
+)
+AGENT_TURN = SpanKind("agent_turn", attrs=AgentTurnAttrs)
+
+@search("dynamic", config=DynamicConfig, roles=ROLES, spans=(WORKSTREAM, AGENT_TURN))
+```
+
+A kind's `attrs` is a pydantic model that forbids unknown keys (refused at declaration
+otherwise); `verdicts` and `links` are the verdict values and link relations it allows. Two kinds
+with one name are refused at `@search`.
+
+```python
+ctx.label(WORKSTREAM, title="ws-3", links=(SpanLink(rel="builds_on", to=base.span),))
+...
+ctx.label(WORKSTREAM, verdict="rejected", reason="slower")    # title and links stay
+await session.turn(prompt, within=s, label=Label(AGENT_TURN, attrs={"role": "implementer"}))
+```
+
+- `ctx.label(kind, **fields)` labels the current flow's span. The fields it names (`title`,
+  `links`, `attrs`, `verdict`, `reason`) replace the earlier ones; the rest stay. A span keeps
+  the kind of its first label.
+- `label=Label(kind, ...)` on `session.turn`, `ctx.evaluation.measure`, `ctx.workspaces.verify`
+  and `ctx.owners.perform` labels the operation's span when it is issued (for a turn, each
+  provider turn of the ask; not its render).
+- A link names a span by its `SpanId`: `ctx.span` for the current flow, `task.span` for a task a
+  group started. A link must name a span the run has already recorded.
+- `verdict` is the search's judgement, kept apart from `status`: a workstream can be `done` and
+  `rejected`.
+- Anything undeclared is a `ContractError` naming it: a kind (`label.kind`), an attribute
+  (`label.<kind>.attrs.<key>`), a verdict (`label.<kind>.verdict`), a relation
+  (`label.<kind>.links.<rel>`), or a link to a span the run never recorded
+  (`label.<kind>.links.<span id>`). Like any defect it crashes the run.
+
+The span holds the label as a `SpanLabel` (the kind's name, the fields, and `attrs_json`, the
+attributes as JSON). A label is an effect of flow code, like `ctx.publish`: replay runs the same
+calls at the same points, so labels replay identically. Labels are not in the digest, so a code
+change that only relabels does not restart the flows (replay relabels the spans with the new
+code); a restart after a code change keeps the labels the spans had.
 
 ### Checkpoints and code changes
 
@@ -321,6 +450,7 @@ def test_a_lost_turn_is_asked_again(begin: Begin) -> None:
 
 - `begin` runs every story twice: live, and with a save-and-restart after every step.
 - `run.waiting()` says what each flow waits for (its sources), so a test can assert it.
+- `run.trace()` is the run trace so far (see "The run trace").
 - `run.timeline()` prints the run as a timeline (`worker.1:Plan stop t=30`); property tests print
   their shrunk counterexamples this way.
 
